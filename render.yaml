@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: legalgen-scanner
+    runtime: node
+    plan: free
+    buildCommand: npm install && npx playwright install chromium
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SCANNER_API_KEY
+        generateValue: true
