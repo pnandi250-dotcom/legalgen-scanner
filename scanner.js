@@ -133,32 +133,6 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-function detectBusinessType(html) {
-  const text = html.toLowerCase();
-  let best = "default", bestScore = 0;
-  for (const [key, cfg] of Object.entries(BUSINESS_TYPES)) {
-    if (key === "default") continue;
-    let score = 0;
-    for (const ind of cfg.indicators) score += (text.match(new RegExp(ind, "gi")) || []).length;
-    if (score > bestScore) { bestScore = score; best = key; }
-  }
-  return BUSINESS_TYPES[best];
-}
-
-function findPolicyLinks($, baseUrl) {
-  const policies = [
-    "Privacy Policy", "Terms of Service", "Refund Policy", "Cookie Policy",
-    "Shipping Policy", "Cancellation Policy", "Return Policy", "Disclaimer",
-    "Acceptable Use", "SLA", "DMCA", "Community Guidelines", "Data Processing",
-    "GDPR", "EULA"
-  ];
-  return policies.map(name => {
-    const link = $(`a:contains("${name}"), a:contains("${name.toLowerCase()}")`).first();
-    const href = link.attr("href");
-    return { expected: name, found: !!href, url: href ? new URL(href, baseUrl).href : null };
-  });
-}
-
 export function createScanner() {
   let browser = null;
 
