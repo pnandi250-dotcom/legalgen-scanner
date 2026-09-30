@@ -24,6 +24,7 @@ function detectBusinessType(html) {
   return BUSINESS_TYPES[best];
 }
 
+// ===== FIX (c): Case-insensitive substring match for policy links =====
 function findPolicyLinks($, baseUrl) {
   const policies = [
     "Privacy Policy", "Terms of Service", "Refund Policy", "Cookie Policy",
@@ -31,10 +32,25 @@ function findPolicyLinks($, baseUrl) {
     "Acceptable Use", "SLA", "DMCA", "Community Guidelines", "Data Processing",
     "GDPR", "EULA"
   ];
+  
+  // Extract all anchor texts once (lowercased for case-insensitive matching)
+  const links = $("a").toArray().map(el => {
+    const $el = $(el);
+    return {
+      text: $el.text().trim().toLowerCase(),
+      href: $el.attr("href"),
+    };
+  }).filter(l => l.href); // only links with href
+  
   return policies.map(name => {
-    const link = $(`a:contains("${name}"), a:contains("${name.toLowerCase()}")`).first();
-    const href = link.attr("href");
-    return { expected: name, found: !!href, url: href ? new URL(href, baseUrl).href : null };
+    const needle = name.toLowerCase();
+    // Case-insensitive substring match: find any link whose text includes the policy name
+    const match = links.find(l => l.text.includes(needle));
+    return { 
+      expected: name, 
+      found: !!match, 
+      url: match ? new URL(match.href, baseUrl).href : null 
+    };
   });
 }
 
@@ -149,7 +165,8 @@ export function createScanner() {
     const context = await browser.newContext({ userAgent: "Mozilla/5.0 LegalGen Scanner" });
     const page = await context.newPage();
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      // ===== FIX (b): Wait for network idle (JS rendered) instead of domcontentloaded =====
+      await page.goto(url, { waitUntil: "networkidle", timeout: 25000 });
       const html = await page.content();
       const finalUrl = page.url();
       await context.close();
@@ -180,9 +197,15 @@ export function createScanner() {
       // Validate URL before scanning
       await assertPublicUrl(parsedUrl);
 
+      // Fetch static HTML first
       let { html, finalUrl } = await fetchWithCheerio(targetUrl).catch(() => ({ html: null, finalUrl: targetUrl }));
 
-      if (!html || html.length < 500) {
+      // ===== FIX (a): Fall back to browser if NO policies found in static HTML (not just short HTML) =====
+      const $static = cheerio.load(html || "");
+      const staticPolicies = findPolicyLinks($static, finalUrl);
+      const staticFoundCount = staticPolicies.filter(p => p.found).length;
+
+      if (!html || html.length < 500 || staticFoundCount === 0) {
         try {
           const result = await fetchWithBrowser(targetUrl);
           html = result.html;
@@ -190,6 +213,7 @@ export function createScanner() {
         } catch {}
       }
 
+      // Re-parse with (possibly browser-rendered) HTML
       const $ = cheerio.load(html || "");
       const title = $("title").text().trim() || null;
       const domain = new URL(finalUrl).hostname;
