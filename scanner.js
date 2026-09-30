@@ -3,6 +3,9 @@ import { chromium } from "playwright";
 import { createHash } from "node:crypto";
 import net from "node:net";
 import { lookup } from "node:dns/promises";
+import { detectJurisdiction, getJurisdictionRequirements } from "./jurisdiction.js";
+import { scorePolicyQuality, quickQualityCheck } from "./quality.js";
+import { scanCache, createQuickScanKey } from "./cache.js";
 
 const BUSINESS_TYPES = {
   ecommerce: { name: "E-Commerce", indicators: ["cart", "checkout", "buy", "shipping", "product", "price"], required: ["Privacy Policy", "Terms of Service", "Refund Policy", "Shipping Policy"] },
@@ -189,13 +192,25 @@ export function createScanner() {
   }
 
   return {
-    async scan(url) {
+    async scan(url, options = {}) {
+      const { scanType = 'quick', userId, ipCountry, pageLanguage, htmlLang, useCache = true } = options;
+      
       let targetUrl = url.trim();
       if (!targetUrl.startsWith("http")) targetUrl = "https://" + targetUrl;
       const parsedUrl = new URL(targetUrl);
       
       // Validate URL before scanning
       await assertPublicUrl(parsedUrl);
+      
+      // Check cache for quick scans
+      const cacheKey = createQuickScanKey(targetUrl, userId);
+      if (useCache && scanType === 'quick') {
+        const cached = scanCache.get(cacheKey);
+        if (cached) {
+          console.log('[scanner] Cache HIT for', targetUrl, 'age:', Math.round(cached.age / 1000), 's');
+          return { ...cached.data, cached: true, cacheAge: cached.age };
+        }
+      }
 
       // Fetch static HTML first
       let { html, finalUrl } = await fetchWithCheerio(targetUrl).catch(() => ({ html: null, finalUrl: targetUrl }));
@@ -218,7 +233,41 @@ export function createScanner() {
       const title = $("title").text().trim() || null;
       const domain = new URL(finalUrl).hostname;
       const businessType = detectBusinessType(html || "");
+      
+      // Detect jurisdiction
+      const jurisdictionResult = detectJurisdiction(targetUrl, { ipCountry, pageLanguage, htmlLang });
+      const jurisdictionRequirements = getJurisdictionRequirements(jurisdictionResult.primary);
+      
       const policies = findPolicyLinks($, finalUrl);
+
+      // Score policy quality for found policies
+      const policyDetails = policies.map(p => {
+        const quality = p.found ? quickQualityCheck($(`a:contains("${p.expected}")`).text() || '') : null;
+        return {
+          expected: p.expected,
+          found: p.found,
+          url: p.url,
+          httpStatus: p.found ? 200 : null,
+          substantive: p.found,
+          confidence: p.found ? (quality?.wordCount >= 500 ? 'high' : 'medium') : 'low',
+          qualityScore: quality?.score,
+          qualityGrade: quality?.estimatedGrade,
+        };
+      });
+
+      // Build missing policies with jurisdiction-aware details
+      const missingPolicies = jurisdictionRequirements.requiredPolicies
+        .filter(req => !policies.some(p => p.expected === req.name && p.found))
+        .map(req => ({
+          id: req.id,
+          name: req.name,
+          regulation: req.regulation,
+          description: req.description,
+          severity: req.severity,
+          generateType: req.id,
+          minWordCount: req.minWordCount,
+          requiredSections: req.requiredSections,
+        }));
 
       const foundPages = policies.filter(p => p.found).map(p => ({ name: p.expected, url: p.url }));
       const missingPages = policies.filter(p => !p.found).map(p => p.expected);
@@ -236,7 +285,7 @@ export function createScanner() {
         generateType: p.expected.toLowerCase().replace(/\s+/g, "-"),
       }));
 
-      return {
+      const result = {
         scannerVersion: "1.0",
         url: targetUrl,
         finalUrl,
@@ -250,9 +299,34 @@ export function createScanner() {
         findings: [],
         score: { value: score, grade: score >= 80 ? "A" : score >= 60 ? "B" : score >= 40 ? "C" : "D", confidence: "medium" },
         riskLevel: score >= 80 ? "LOW" : score >= 50 ? "MEDIUM" : "HIGH",
-        checksPerformed: ["policy-detection", "business-classification"],
+        checksPerformed: ["policy-detection", "business-classification", "jurisdiction-detection"],
         checksSkipped: [],
+        // New fields
+        jurisdiction: {
+          primary: jurisdictionResult.primary,
+          all: jurisdictionResult.all,
+          confidence: jurisdictionResult.confidence,
+          sources: jurisdictionResult.sources,
+        },
+        missingPolicies,
+        policyQuality: policies.filter(p => p.found).map(p => {
+          const quality = quickQualityCheck($(`a:contains("${p.expected}")`).text() || '');
+          return {
+            name: p.expected,
+            qualityScore: quality.wordCount,
+            qualityGrade: quality.estimatedGrade,
+          };
+        }),
+        cached: false,
       };
+
+      // Cache the result for quick scans
+      if (useCache && scanType === 'quick') {
+        scanCache.set(cacheKey, result);
+        console.log('[scanner] Cached result for', targetUrl);
+      }
+
+      return result;
     }
   };
 }
