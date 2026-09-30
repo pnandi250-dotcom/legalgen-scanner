@@ -3,6 +3,8 @@
  * Evaluates policy content quality based on word count, required sections, and content depth
  */
 
+import type { RequiredPolicy } from "./jurisdiction.js";
+
 export interface PolicyQualityResult {
   score: number; // 0-100
   grade: 'A' | 'B' | 'C' | 'D' | 'F';
@@ -135,21 +137,6 @@ const SECTION_PATTERNS: Record<string, RegExp[]> = {
   'Automated Decision Making': [
     /automated decision/i,
     /profiling/i,
-  ],
-  'DPO Contact': [
-    /data protection officer/i,
-    /dpo/i,
-    /privacy officer/i,
-  ],
-  'Records of Processing Activities': [
-    /records of processing/i,
-    /ropas?/i,
-    /article 30/i,
-  ],
-  'Data Breach Notification': [
-    /data breach/i,
-    /breach notification/i,
-    /72 hours/i,
   ],
   'Accessibility Statement': [
     /accessibility statement/i,
@@ -408,19 +395,19 @@ export function scorePolicyQuality(
   };
 }
 
-export function scoreMultiplePolicies(
+export async function scoreMultiplePolicies(
   policies: Array<{ url: string; html: string; text: string; title: string; expectedType: string }>,
   jurisdiction: string
-): Map<string, PolicyQualityResult> {
-  // Import here to avoid circular dependency
-  const { getJurisdictionRequirements } = require('./jurisdiction');
-  const reqs = require('./jurisdiction').getJurisdictionRequirements(jurisdiction);
+): Promise<Map<string, PolicyQualityResult>> {
+  // Import dynamically to avoid circular dependency
+  const { getJurisdictionRequirements } = await import('./jurisdiction.js');
+  const reqs = getJurisdictionRequirements(jurisdiction);
   
   const results = new Map<string, PolicyQualityResult>();
   
   for (const policy of policies) {
     const requiredSections = reqs.requiredPolicies
-      .find(p => p.id === policy.expectedType.toLowerCase().replace(/\s+/g, '-'))?.requiredSections || [];
+      .find((p: RequiredPolicy) => p.id === policy.expectedType.toLowerCase().replace(/\s+/g, '-'))?.requiredSections || [];
     
     const result = scorePolicyQuality({
       url: policy.url,

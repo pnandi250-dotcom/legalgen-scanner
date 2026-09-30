@@ -1,13 +1,35 @@
 import * as cheerio from "cheerio";
-import { chromium } from "playwright";
+import { chromium, Browser, BrowserContext, Page } from "playwright";
 import { createHash } from "node:crypto";
 import net from "node:net";
 import { lookup } from "node:dns/promises";
-import { detectJurisdiction, getJurisdictionRequirements } from "./jurisdiction.js";
+import { detectJurisdiction, getJurisdictionRequirements, JurisdictionRequirements, RequiredPolicy, JurisdictionResult } from "./jurisdiction.js";
 import { scorePolicyQuality, quickQualityCheck } from "./quality.js";
 import { scanCache, createQuickScanKey } from "./cache.js";
+import type { CheerioAPI, Cheerio } from "cheerio";
 
-const BUSINESS_TYPES = {
+interface ScanOptions {
+  scanType?: 'quick' | 'deep';
+  userId?: string;
+  ipCountry?: string;
+  pageLanguage?: string;
+  htmlLang?: string;
+  useCache?: boolean;
+}
+
+interface PolicyLink {
+  expected: string;
+  found: boolean;
+  url: string | null;
+}
+
+interface BusinessTypeConfig {
+  name: string;
+  indicators: string[];
+  required: string[];
+}
+
+const BUSINESS_TYPES: Record<string, BusinessTypeConfig> = {
   ecommerce: { name: "E-Commerce", indicators: ["cart", "checkout", "buy", "shipping", "product", "price"], required: ["Privacy Policy", "Terms of Service", "Refund Policy", "Shipping Policy"] },
   saas: { name: "SaaS/Tech", indicators: ["signup", "trial", "pricing", "dashboard", "api", "login"], required: ["Privacy Policy", "Terms of Service", "SLA", "Acceptable Use"] },
   finance: { name: "Finance", indicators: ["loan", "invest", "bank", "kyc", "rbi", "sebi"], required: ["Privacy Policy", "Risk Disclosure", "Grievance Redressal", "KYC Policy"] },
@@ -15,7 +37,7 @@ const BUSINESS_TYPES = {
   default: { name: "General Business", indicators: [], required: ["Privacy Policy", "Terms of Service", "Cookie Policy"] },
 };
 
-function detectBusinessType(html) {
+function detectBusinessType(html: string): BusinessTypeConfig {
   const text = html.toLowerCase();
   let best = "default", bestScore = 0;
   for (const [key, cfg] of Object.entries(BUSINESS_TYPES)) {
@@ -28,7 +50,7 @@ function detectBusinessType(html) {
 }
 
 // ===== FIX (c): Case-insensitive substring match for policy links =====
-function findPolicyLinks($, baseUrl) {
+function findPolicyLinks($: CheerioAPI, baseUrl: string): PolicyLink[] {
   const policies = [
     "Privacy Policy", "Terms of Service", "Refund Policy", "Cookie Policy",
     "Shipping Policy", "Cancellation Policy", "Return Policy", "Disclaimer",
@@ -37,18 +59,18 @@ function findPolicyLinks($, baseUrl) {
   ];
   
   // Extract all anchor texts once (lowercased for case-insensitive matching)
-  const links = $("a").toArray().map(el => {
+  const links = $("a").toArray().map((el): { text: string; href: string } => {
     const $el = $(el);
     return {
       text: $el.text().trim().toLowerCase(),
-      href: $el.attr("href"),
+      href: $el.attr("href") || "",
     };
-  }).filter(l => l.href); // only links with href
+  }).filter((l): l is { text: string; href: string } => l.href !== undefined && l.href !== ""); // only links with href
   
-  return policies.map(name => {
+  return policies.map((name): PolicyLink => {
     const needle = name.toLowerCase();
     // Case-insensitive substring match: find any link whose text includes the policy name
-    const match = links.find(l => l.text.includes(needle));
+    const match = links.find((l) => l.text.includes(needle));
     return { 
       expected: name, 
       found: !!match, 
@@ -62,16 +84,16 @@ const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 const BLOCKED_PORTS = new Set([22, 23, 25, 53, 110, 143, 465, 587, 993, 995, 1433, 1521, 3306, 5432, 6379, 9200, 11211, 27017, 2375, 2376, 10250]);
 const BLOCKED_HOSTNAMES = ["localhost", "metadata.google.internal", "metadata.goog", "instance-data", "169.254.169.254"];
 
-function isBlockedAddress(ip) {
+function isBlockedAddress(ip: string): boolean {
   const version = net.isIP(ip);
   if (version === 4) return isBlockedIPv4(ip);
   if (version === 6) return isBlockedIPv6(ip);
   return true;
 }
 
-function isBlockedIPv4(ip) {
+function isBlockedIPv4(ip: string): boolean {
   const p = ip.split(".").map(Number);
-  if (p.length !== 4 || p.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  if (p.length !== 4 || p.some((n: number) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
   const [a, b] = p;
   if (a === 0 || a === 10 || a === 127) return true;
   if (a === 169 && b === 254) return true;
@@ -86,7 +108,7 @@ function isBlockedIPv4(ip) {
   return false;
 }
 
-function isBlockedIPv6(ip) {
+function isBlockedIPv6(ip: string): boolean {
   const addr = ip.toLowerCase().split("%")[0];
   if (addr === "::" || addr === "::1") return true;
   const mapped = addr.match(/^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/);
@@ -99,7 +121,7 @@ function isBlockedIPv6(ip) {
   return false;
 }
 
-async function assertPublicUrl(url) {
+async function assertPublicUrl(url: URL): Promise<{ address: string; family: number } | void> {
   const host = url.hostname.toLowerCase().replace(/\.$/, "");
 
   if (BLOCKED_HOSTNAMES.includes(host) || host.endsWith(".localhost") || host.endsWith(".internal")) {
@@ -134,9 +156,9 @@ const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX = 10; // 10 requests per minute per IP
 
-function checkRateLimit(ip) {
+function checkRateLimit(ip: string): boolean {
   const now = Date.now();
-  const key = `${ip}:${Math.floor(now / RATE_LIMIT_WINDOW)}`;
+  const key = `${ip}:${Math.floor(Date.now() / RATE_LIMIT_WINDOW)}`;
   const count = (rateLimitMap.get(key) || 0) + 1;
   rateLimitMap.set(key, count);
   if (count > RATE_LIMIT_MAX) return false;
@@ -153,23 +175,23 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 export function createScanner() {
-  let browser = null;
+  let browser: Browser | null = null;
 
-  async function getBrowser() {
+  async function getBrowser(): Promise<Browser> {
     if (!browser) {
       browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
     }
     return browser;
   }
 
-  async function fetchWithBrowser(url) {
+  async function fetchWithBrowser(url: URL): Promise<{ html: string; finalUrl: string }> {
     await assertPublicUrl(url);
     const browser = await getBrowser();
-    const context = await browser.newContext({ userAgent: "Mozilla/5.0 LegalGen Scanner" });
-    const page = await context.newPage();
+    const context: BrowserContext = await browser.newContext({ userAgent: "Mozilla/5.0 LegalGen Scanner" });
+    const page: Page = await context.newPage();
     try {
       // ===== FIX (b): Wait for network idle (JS rendered) instead of domcontentloaded =====
-      await page.goto(url, { waitUntil: "networkidle", timeout: 25000 });
+      await page.goto(url.toString(), { waitUntil: "networkidle", timeout: 25000 });
       const html = await page.content();
       const finalUrl = page.url();
       await context.close();
@@ -180,9 +202,9 @@ export function createScanner() {
     }
   }
 
-  async function fetchWithCheerio(url) {
+  async function fetchWithCheerio(url: URL): Promise<{ html: string; finalUrl: string }> {
     await assertPublicUrl(url);
-    const res = await fetch(url, { 
+    const res = await fetch(url.toString(), { 
       headers: { "User-Agent": "Mozilla/5.0 LegalGen Scanner" }, 
       redirect: "follow",
       signal: AbortSignal.timeout(10000)
@@ -192,12 +214,15 @@ export function createScanner() {
   }
 
   return {
-    async scan(url, options = {}) {
+    async scan(url: string, options: ScanOptions = {}): Promise<any> {
       const { scanType = 'quick', userId, ipCountry, pageLanguage, htmlLang, useCache = true } = options;
       
       let targetUrl = url.trim();
       if (!targetUrl.startsWith("http")) targetUrl = "https://" + targetUrl;
       const parsedUrl = new URL(targetUrl);
+      
+      // Validate URL before scanning
+      await assertPublicUrl(parsedUrl);
       
       // Validate URL before scanning
       await assertPublicUrl(parsedUrl);
@@ -213,7 +238,8 @@ export function createScanner() {
       }
 
       // Fetch static HTML first
-      let { html, finalUrl } = await fetchWithCheerio(targetUrl).catch(() => ({ html: null, finalUrl: targetUrl }));
+      const parsedUrlForFetch = new URL(targetUrl);
+      let { html, finalUrl } = await fetchWithCheerio(parsedUrlForFetch).catch(() => ({ html: null, finalUrl: targetUrl }));
 
       // ===== FIX (a): Fall back to browser if NO policies found in static HTML (not just short HTML) =====
       const $static = cheerio.load(html || "");
@@ -222,7 +248,7 @@ export function createScanner() {
 
       if (!html || html.length < 500 || staticFoundCount === 0) {
         try {
-          const result = await fetchWithBrowser(targetUrl);
+          const result = await fetchWithBrowser(new URL(targetUrl));
           html = result.html;
           finalUrl = result.finalUrl;
         } catch {}
@@ -243,14 +269,15 @@ export function createScanner() {
       // Score policy quality for found policies
       const policyDetails = policies.map(p => {
         const quality = p.found ? quickQualityCheck($(`a:contains("${p.expected}")`).text() || '') : null;
+        const wordCount = quality?.wordCount ?? 0;
         return {
           expected: p.expected,
           found: p.found,
           url: p.url,
           httpStatus: p.found ? 200 : null,
           substantive: p.found,
-          confidence: p.found ? (quality?.wordCount >= 500 ? 'high' : 'medium') : 'low',
-          qualityScore: quality?.score,
+          confidence: p.found ? (wordCount >= 500 ? 'high' : 'medium') : 'low',
+          qualityScore: wordCount,
           qualityGrade: quality?.estimatedGrade,
         };
       });

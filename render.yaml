@@ -3,7 +3,7 @@ services:
     name: legalgen-scanner
     runtime: node
     plan: free
-    buildCommand: npm install && npx playwright install chromium
+    buildCommand: npm install && npm run build && npx playwright install chromium
     startCommand: npm start
     envVars:
       - key: NODE_ENV
