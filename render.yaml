@@ -4,7 +4,7 @@ services:
     runtime: node
     plan: free
     buildCommand: npm install --production=false && npm run build
-    startCommand: sh -c 'if [ ! -f dist/server.js ]; then npm run build; fi && node dist/server.js'
+    startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
