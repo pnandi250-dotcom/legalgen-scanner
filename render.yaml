@@ -18,3 +18,5 @@ services:
         value: "warn"
       - key: npm_config_package_manager
         value: "npm"
+      - key: NPM_CONFIG_LOGLEVEL
+        value: "warn"
