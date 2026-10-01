@@ -16,3 +16,5 @@ services:
         value: "--max-old-space-size=400"
       - key: NPM_CONFIG_LOGLEVEL
         value: "warn"
+      - key: npm_config_package_manager
+        value: "npm"
