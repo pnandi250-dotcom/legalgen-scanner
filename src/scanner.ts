@@ -53,6 +53,70 @@ function detectBusinessType(html: string): { name: string; indicators: string[];
   return BUSINESS_TYPES[best];
 }
 
+// ===== TECHNOLOGY DETECTION (static signature lookup) =====
+const TECHNOLOGY_SIGNATURES: Array<{ src: string; name: string; category: string }> = [
+  // Payment
+  { src: "razorpay.com", name: "Razorpay", category: "Payment" },
+  { src: "payu.in", name: "PayU", category: "Payment" },
+  { src: "cashfree.com", name: "Cashfree", category: "Payment" },
+  { src: "instamojo.com", name: "Instamojo", category: "Payment" },
+  { src: "ccavenue.com", name: "CCVenue", category: "Payment" },
+  { src: "stripe.com", name: "Stripe", category: "Payment" },
+  { src: "paypal.com", name: "PayPal", category: "Payment" },
+  // Analytics
+  { src: "google-analytics.com", name: "Google Analytics", category: "Analytics" },
+  { src: "googletagmanager.com", name: "Google Tag Manager", category: "Analytics" },
+  { src: "hotjar.com", name: "Hotjar", category: "Analytics" },
+  { src: "mixpanel.com", name: "Mixpanel", category: "Analytics" },
+  { src: "segment.com", name: "Segment", category: "Analytics" },
+  // Advertising
+  { src: "facebook.net", name: "Meta Pixel", category: "Advertising" },
+  { src: "doubleclick.net", name: "DoubleClick", category: "Advertising" },
+  { src: "ads-twitter.com", name: "Twitter Ads", category: "Advertising" },
+  // Email / CRM
+  { src: "mailchimp.com", name: "Mailchimp", category: "Email/CRM" },
+  { src: "hubspot.com", name: "HubSpot", category: "Email/CRM" },
+  { src: "zoho.com", name: "Zoho", category: "Email/CRM" },
+  { src: "freshworks.com", name: "Freshworks", category: "Email/CRM" },
+  // Chat / Support
+  { src: "intercom.io", name: "Intercom", category: "Chat/Support" },
+  { src: "crisp.chat", name: "Crisp", category: "Chat/Support" },
+  { src: "tawk.to", name: "Tawk.to", category: "Chat/Support" },
+  { src: "freshchat.com", name: "FreshChat", category: "Chat/Support" },
+  // Auth
+  { src: "firebase.google.com", name: "Firebase Auth", category: "Auth" },
+  { src: "auth0.com", name: "Auth0", category: "Auth" },
+];
+
+function detectTechnologies($: CheerioAPI): Array<{ name: string; category: string }> {
+  const sources: string[] = $("script[src], iframe[src]")
+    .toArray()
+    .map((el: any) => $(el).attr("src") as string | undefined)
+    .filter((src: string | undefined): src is string => typeof src === "string" && src.length > 0)
+    .map((src: string) => src.toLowerCase());
+
+  const detected = new Map<string, { name: string; category: string }>();
+  for (const source of sources) {
+    for (const signature of TECHNOLOGY_SIGNATURES) {
+      if (source.includes(signature.src) && !detected.has(signature.name)) {
+        detected.set(signature.name, { name: signature.name, category: signature.category });
+      }
+    }
+  }
+  return Array.from(detected.values());
+}
+
+// ===== BOUNDED MULTI-PAGE POLICY CRAWL =====
+const MAX_CRAWL_URLS = 4;
+const CRAWL_TIME_BUDGET_MS = 15000;
+const SCAN_DEADLINE_MS = 25_000;
+const CRAWL_FETCH_TIMEOUT_MS = 5000;
+// Rendering a page through Browserless only pays off if there is real budget left to spend on it.
+const BROWSERLESS_MIN_BUDGET_MS = 8000;
+const CRAWL_MIN_WORDS = 150;
+const CRAWL_MATCH_WORD_WINDOW = 500;
+const POLICY_LINK_KEYWORDS = ["privacy", "terms", "legal", "policy", "policies", "tos", "refund", "shipping", "cookie"];
+
 // ===== FIX (c): Case-insensitive substring match for policy links =====
 function findPolicyLinks($: any, baseUrl: string): { expected: string; found: boolean; url: string | null }[] {
   const policies = [
@@ -153,6 +217,9 @@ async function assertPublicUrl(url: URL): Promise<{ address: string; family: num
   return records[0];
 }
 
+// Redirect chains are followed manually so each hop passes the SSRF guard above.
+const MAX_REDIRECT_HOPS = 5;
+
 // ===== RATE LIMITING =====
 const rateLimitMap = new Map<string, number>();
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
@@ -181,25 +248,48 @@ export function createScanner() {
   const BLOCKED_PORTS = new Set([22, 23, 25, 53, 110, 143, 465, 587, 993, 995, 1433, 1521, 3306, 5432, 6379, 9200, 11211, 27017, 2375, 2376, 10250]);
   const BLOCKED_HOSTNAMES = ["localhost", "metadata.google.internal", "metadata.goog", "instance-data", "169.254.169.254"];
 
-  async function fetchWithCheerio(url: URL): Promise<{ html: string; finalUrl: string }> {
+  async function fetchWithCheerio(url: URL, timeoutMs: number = 10000, deadlineAt?: number): Promise<{ html: string; finalUrl: string; status: number }> {
     await assertPublicUrl(url);
-    const res = await fetch(url.toString(), { 
-      headers: { "User-Agent": "Mozilla/5.0 LegalGen Scanner" }, 
-      redirect: "follow",
-      signal: AbortSignal.timeout(10000)
-    });
+    // Redirects are followed manually so that every hop is re-validated by assertPublicUrl
+    // before the next outbound request is made. "redirect: follow" would hand the chain to
+    // undici, which happily follows a 302 to a link-local/internal address with no further check.
+    // Every hop re-clamps its own timeout to whatever is left of the caller's deadline, so a
+    // multi-hop chain cannot multiply timeoutMs and overrun the overall scan budget.
+    const request = (target: URL) => {
+      const remaining = deadlineAt === undefined ? timeoutMs : Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now()));
+      return fetch(target.toString(), {
+        headers: { "User-Agent": "Mozilla/5.0 LegalGen Scanner" },
+        redirect: "manual",
+        signal: AbortSignal.timeout(remaining)
+      });
+    };
+
+    let currentUrl = url;
+    let res = await request(currentUrl);
+    let hops = 0;
+    while (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) break;
+      if (++hops > MAX_REDIRECT_HOPS) throw new Error("Too many redirects");
+      const nextUrl = new URL(location, currentUrl);
+      await assertPublicUrl(nextUrl);
+      currentUrl = nextUrl;
+      res = await request(currentUrl);
+    }
     const html = await res.text();
-    return { html, finalUrl: res.url };
+    return { html, finalUrl: currentUrl.toString(), status: res.status };
   }
 
   // ===== BROWSERLESS.IO FALLBACK (for JS-heavy sites) =====
-  async function fetchWithBrowserless(url: URL): Promise<{ html: string; finalUrl: string } | null> {
+  async function fetchWithBrowserless(url: URL, deadlineAt?: number): Promise<{ html: string; finalUrl: string } | null> {
     const apiKey = process.env.BROWSERLESS_API_KEY;
     if (!apiKey) {
       console.log('[scanner] Browserless API key not configured, skipping fallback');
       return null;
     }
 
+    // Browserless drives the navigation itself, so redirects it follows internally cannot be
+    // intercepted here; this check guards the entry URL only.
     await assertPublicUrl(url);
     
     try {
@@ -217,7 +307,7 @@ export function createScanner() {
           blockAds: true,
           blockResources: ['image', 'font', 'media']
         }),
-        signal: AbortSignal.timeout(30000)
+        signal: AbortSignal.timeout(deadlineAt === undefined ? 30000 : Math.max(1, deadlineAt - Date.now()))
       });
 
       if (!res.ok) {
@@ -237,6 +327,10 @@ export function createScanner() {
 
   return {
     async scan(url: string, options: any = {}): Promise<any> {
+      const scanStart = Date.now();
+      const scanElapsed = () => Date.now() - scanStart;
+      const checksPerformed: string[] = ["policy-detection", "business-classification", "jurisdiction-detection"];
+      const checksSkipped: Array<{ check: string; reason: string }> = [];
       const { scanType = 'quick', userId, ipCountry, pageLanguage, htmlLang, useCache = true } = options;
       
       let targetUrl = url.trim();
@@ -260,7 +354,7 @@ export function createScanner() {
 
 // Fetch static HTML only (no Playwright - lightweight for free tier)
       const parsedUrlForFetch = new URL(targetUrl);
-      let { html, finalUrl } = await fetchWithCheerio(parsedUrlForFetch).catch(() => ({ html: null, finalUrl: targetUrl }));
+      let { html, finalUrl } = await fetchWithCheerio(parsedUrlForFetch, 10000, scanStart + SCAN_DEADLINE_MS).catch(() => ({ html: null, finalUrl: targetUrl }));
 
       // Detect jurisdiction
       const jurisdictionResult = detectJurisdiction(targetUrl, { ipCountry, pageLanguage, htmlLang });
@@ -276,22 +370,164 @@ export function createScanner() {
       const staticFoundCount = staticPolicies.filter(p => p.found).length;
 
       if (staticFoundCount === 0) {
-        console.log('[scanner] No policies found via Cheerio, trying Browserless.io fallback...');
-        const browserlessResult = await fetchWithBrowserless(new URL(targetUrl));
-        if (browserlessResult) {
-          finalHtmlVar = browserlessResult.html;
-          finalUrlVar = browserlessResult.finalUrl;
-          console.log('[scanner] Browserless fallback found content, re-parsing...');
+        const browserlessBudget = SCAN_DEADLINE_MS - scanElapsed();
+        if (browserlessBudget < BROWSERLESS_MIN_BUDGET_MS) {
+          checksSkipped.push({ check: "browserless-fallback", reason: "Insufficient remaining scan budget to attempt browser rendering" });
+          console.log('[scanner] Browserless fallback skipped: only', browserlessBudget, 'ms of scan budget left after', scanElapsed(), 'ms');
+        } else {
+          console.log('[scanner] No policies found via Cheerio, trying Browserless.io fallback...');
+          const browserlessResult = await fetchWithBrowserless(new URL(targetUrl), scanStart + SCAN_DEADLINE_MS);
+          if (browserlessResult) {
+            finalHtmlVar = browserlessResult.html;
+            finalUrlVar = browserlessResult.finalUrl;
+            console.log('[scanner] Browserless fallback found content, re-parsing...');
+          }
         }
       }
 
       // Parse with (possibly Browserless-rendered) HTML
       const $ = cheerio.load(finalHtmlVar || "");
-      const policies = findPolicyLinks($, finalUrl);
+      let policies = findPolicyLinks($, finalUrl);
 
       const title = $("title").text().trim() || null;
       const domain = new URL(finalUrl).hostname;
       const businessType = detectBusinessType(finalHtmlVar || "");
+      const businessTypeKey = Object.entries(BUSINESS_TYPES).find(([, cfg]) => cfg === businessType)?.[0] ?? "default";
+
+      // ===== BOUNDED MULTI-PAGE POLICY CRAWL =====
+      // Link-only detection misses policies published on combined pages (e.g. one "Legal"
+      // page holding both privacy + terms), so crawl a small, time-boxed set of policy-ish links.
+      const requiredPolicyNames: string[] = jurisdictionRequirements.requiredPolicies.map(req => req.name);
+      const missingRequiredNames = (): string[] =>
+        requiredPolicyNames.filter(name => !policies.some(p => p.expected === name && p.found));
+
+      let crawlFetchAttempted = false;
+      let crawlPhaseRan = false;
+      const crawlStatusByPolicy = new Map<string, number>();
+      const crawlBudget = Math.min(CRAWL_TIME_BUDGET_MS, SCAN_DEADLINE_MS - scanElapsed());
+
+      if (missingRequiredNames().length === 0) {
+        checksSkipped.push({ check: "multi-page-policy-crawl", reason: "All required policies already linked on the initial page" });
+      } else if (crawlBudget <= 0) {
+        checksSkipped.push({ check: "multi-page-policy-crawl", reason: "Scan time budget exhausted before crawl could start" });
+        console.log('[scanner] Multi-page crawl skipped: scan time budget already exhausted after', scanElapsed(), 'ms');
+      } else {
+        const crawlStart = Date.now();
+        const baseUrl = finalUrlVar || targetUrl;
+        let scannedUrl = targetUrl;
+        try { scannedUrl = new URL(baseUrl).href; } catch { scannedUrl = targetUrl; }
+        const missingAtExtract = missingRequiredNames().map(name => name.toLowerCase());
+        const seenCandidateUrls = new Set<string>();
+        const candidates: Array<{ url: string; rank: number; order: number }> = [];
+
+        $("a").toArray().forEach((el: any, order: number) => {
+          const $el = $(el);
+          const href = ($el.attr("href") || "").trim();
+          if (!href) return;
+          const lowerHref = href.toLowerCase();
+          if (lowerHref.startsWith("#") || lowerHref.startsWith("javascript:") || lowerHref.startsWith("mailto:") || lowerHref.startsWith("tel:")) return;
+          const linkText = $el.text().trim().toLowerCase();
+          if (!POLICY_LINK_KEYWORDS.some(k => lowerHref.includes(k)) && !POLICY_LINK_KEYWORDS.some(k => linkText.includes(k))) return;
+
+          let absolute: string;
+          try {
+            absolute = new URL(href, baseUrl).href;
+          } catch {
+            return;
+          }
+          if (absolute === scannedUrl || seenCandidateUrls.has(absolute)) return;
+          seenCandidateUrls.add(absolute);
+
+          // Prefer links whose text names a still-missing policy, then href-path matches.
+          let rank = 0;
+          if (missingAtExtract.some(name => name.length > 3 && linkText.includes(name))) rank = 2;
+          else if (missingAtExtract.some(name => name.length > 3 && absolute.toLowerCase().includes(name))) rank = 1;
+          candidates.push({ url: absolute, rank, order });
+        });
+
+        candidates.sort((a, b) => (b.rank - a.rank) || (a.order - b.order));
+        const limitedCandidates = candidates.slice(0, MAX_CRAWL_URLS);
+
+        if (limitedCandidates.length === 0) {
+          checksSkipped.push({ check: "multi-page-policy-crawl", reason: "No policy-like links found on the initial page" });
+          console.log('[scanner] Multi-page crawl skipped: no policy candidate links found');
+        } else {
+          console.log('[scanner] Multi-page policy crawl:', limitedCandidates.length, 'of', candidates.length, 'candidate link(s)');
+        }
+
+        for (const candidate of limitedCandidates) {
+          crawlPhaseRan = true;
+          const elapsed = Date.now() - crawlStart;
+          if (elapsed > crawlBudget) {
+            checksSkipped.push({ check: "multi-page-policy-crawl", reason: `Crawl time budget of ${crawlBudget}ms exceeded after ${elapsed}ms` });
+            console.log('[scanner] Multi-page crawl budget exhausted after', elapsed, 'ms');
+            break;
+          }
+          const remainingBudget = crawlBudget - elapsed;
+          if (remainingBudget <= 0) break;
+
+          if (missingRequiredNames().length === 0) {
+            console.log('[scanner] All required policies resolved, stopping crawl early');
+            break;
+          }
+
+          try {
+            const candidateUrl = candidate.url;
+            await assertPublicUrl(new URL(candidateUrl));
+            // DNS resolution above has no timeout of its own, so charge it to the crawl
+            // budget before spending a fetch on the candidate.
+            const budgetAfterDns = crawlBudget - (Date.now() - crawlStart);
+            if (budgetAfterDns <= 0) {
+              checksSkipped.push({ check: "multi-page-policy-crawl", reason: `Crawl time budget of ${crawlBudget}ms exhausted while validating candidate links` });
+              console.log('[scanner] Multi-page crawl budget exhausted during candidate validation');
+              break;
+            }
+            crawlFetchAttempted = true;
+            const crawled = await fetchWithCheerio(new URL(candidateUrl), CRAWL_FETCH_TIMEOUT_MS, crawlStart + crawlBudget);
+            if (crawled.status < 200 || crawled.status >= 300) {
+              console.log('[scanner] Crawl candidate returned non-OK status, skipping:', candidateUrl, '-', crawled.status);
+              continue;
+            }
+
+            const crawl$ = cheerio.load(crawled.html || "");
+            crawl$("script, style, noscript").remove();
+            const visibleText = (crawl$("body").text() || crawl$.root().text() || "").replace(/\s+/g, " ").trim();
+            const wordCount = visibleText ? visibleText.split(" ").length : 0;
+            if (wordCount <= CRAWL_MIN_WORDS) {
+              console.log('[scanner] Crawl candidate too thin:', candidateUrl, '-', wordCount, 'words');
+              continue;
+            }
+
+            const crawlTitle = (crawl$("title").text() || "").toLowerCase();
+            const leadText = visibleText.toLowerCase().split(" ").slice(0, CRAWL_MATCH_WORD_WINDOW).join(" ");
+
+            const matched: string[] = [];
+            for (const name of missingRequiredNames()) {
+              const needle = name.toLowerCase();
+              if (!crawlTitle.includes(needle) && !leadText.includes(needle)) continue;
+              const entry = policies.find(p => p.expected === name);
+              if (entry) {
+                entry.found = true;
+                entry.url = candidateUrl;
+              } else {
+                policies.push({ expected: name, found: true, url: candidateUrl });
+              }
+              crawlStatusByPolicy.set(name, crawled.status);
+              matched.push(name);
+            }
+            if (matched.length > 0) console.log('[scanner] Crawl candidate resolved:', candidateUrl, '->', matched.join(', '));
+          } catch (error) {
+            console.warn('[scanner] Crawl candidate failed:', candidate.url, error instanceof Error ? error.message : String(error));
+            continue;
+          }
+        }
+      }
+
+      if (crawlFetchAttempted) checksPerformed.push("multi-page-policy-crawl");
+      else if (crawlPhaseRan && !checksSkipped.some(s => s.check === "multi-page-policy-crawl")) {
+        checksSkipped.push({ check: "multi-page-policy-crawl", reason: "Crawl attempted but no candidate page could be fetched (all rejected by the SSRF guard or the time budget ran out)" });
+      }
+      const technologies = detectTechnologies($);
 
       // Score policy quality for found policies
       const policyDetails = policies.map(p => {
@@ -334,15 +570,15 @@ export function createScanner() {
         domain,
         scannedAt: new Date().toISOString(),
         title,
-        businessType: { key: Object.keys(BUSINESS_TYPES).find(k => BUSINESS_TYPES[k] === detectBusinessType("")) || "default", name: detectBusinessType("").name, confidence: 0.8 },
-        technologies: [],
+        businessType: { key: businessTypeKey, name: businessType.name, confidence: 0.8 },
+        technologies,
         forms: [],
-        policies: policies.map(p => ({ expected: p.expected, found: p.found, url: p.url, httpStatus: p.found ? 200 : null, substantive: p.found, confidence: p.found ? "high" : "low" })),
+        policies: policies.map(p => ({ expected: p.expected, found: p.found, url: p.url, httpStatus: p.found ? (crawlStatusByPolicy.get(p.expected) ?? 200) : null, substantive: p.found, confidence: p.found ? "high" : "low" })),
         findings: [],
         score: { value: score, grade: score >= 80 ? "A" : score >= 60 ? "B" : score >= 40 ? "C" : "D", confidence: "medium" },
         riskLevel: score >= 80 ? "LOW" : score >= 50 ? "MEDIUM" : "HIGH",
-        checksPerformed: ["policy-detection", "business-classification", "jurisdiction-detection"],
-        checksSkipped: [],
+        checksPerformed,
+        checksSkipped,
         jurisdiction: {
           primary: jurisdictionResult.primary,
           all: jurisdictionResult.all,
