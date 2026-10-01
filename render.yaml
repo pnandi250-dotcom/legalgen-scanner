@@ -3,14 +3,10 @@ services:
     name: legalgen-scanner
     runtime: node
     plan: free
-    buildCommand: npm ci && npm run build && npx playwright install --with-deps chromium
+    buildCommand: npm ci && npm run build
     startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
       - key: SCANNER_API_KEY
         generateValue: true
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/.cache/ms-playwright
-      - key: NODE_OPTIONS
-        value: "--max-old-space-size=400"
