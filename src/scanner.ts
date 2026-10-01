@@ -1,6 +1,6 @@
 /**
- * Lightweight Scanner Service (Cheerio-only, no Playwright)
- * Optimized for Render free tier (512MB memory)
+ * Hybrid Scanner Service (Cheerio primary + Browserless.io fallback)
+ * Optimized for Render free tier - uses Cheerio primarily, falls back to Browserless.io for JS-heavy sites
  */
 
 import * as cheerio from "cheerio";
@@ -192,6 +192,49 @@ export function createScanner() {
     return { html, finalUrl: res.url };
   }
 
+  // ===== BROWSERLESS.IO FALLBACK (for JS-heavy sites) =====
+  async function fetchWithBrowserless(url: URL): Promise<{ html: string; finalUrl: string } | null> {
+    const apiKey = process.env.BROWSERLESS_API_KEY;
+    if (!apiKey) {
+      console.log('[scanner] Browserless API key not configured, skipping fallback');
+      return null;
+    }
+
+    await assertPublicUrl(url);
+    
+    try {
+      const browserlessUrl = `https://chrome.browserless.io/content?token=${apiKey}`;
+      const res = await fetch(browserlessUrl, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 LegalGen Scanner'
+        },
+        body: JSON.stringify({
+          url: url.toString(),
+          waitUntil: 'networkidle2',
+          timeout: 25000,
+          blockAds: true,
+          blockResources: ['image', 'font', 'media']
+        }),
+        signal: AbortSignal.timeout(30000)
+      });
+
+      if (!res.ok) {
+        console.warn('[scanner] Browserless request failed:', res.status, await res.text());
+        return null;
+      }
+
+      const html = await res.text();
+      const finalUrl = url.toString(); // Browserless returns final URL in response
+      console.log('[scanner] Browserless fallback succeeded for', url.toString());
+      return { html, finalUrl };
+    } catch (error) {
+      console.warn('[scanner] Browserless fallback failed:', error instanceof Error ? error.message : String(error));
+      return null;
+    }
+  }
+
   return {
     async scan(url: string, options: any = {}): Promise<any> {
       const { scanType = 'quick', userId, ipCountry, pageLanguage, htmlLang, useCache = true } = options;
@@ -215,21 +258,40 @@ export function createScanner() {
         }
       }
 
-      // Fetch static HTML only (no Playwright - lightweight for free tier)
+// Fetch static HTML only (no Playwright - lightweight for free tier)
       const parsedUrlForFetch = new URL(targetUrl);
       let { html, finalUrl } = await fetchWithCheerio(parsedUrlForFetch).catch(() => ({ html: null, finalUrl: targetUrl }));
 
-      // Parse with Cheerio only (no Playwright - lightweight)
-      const $ = cheerio.load(html || "");
-      const title = $("title").text().trim() || null;
-      const domain = new URL(finalUrl).hostname;
-      const businessType = detectBusinessType(html || "");
-      
       // Detect jurisdiction
       const jurisdictionResult = detectJurisdiction(targetUrl, { ipCountry, pageLanguage, htmlLang });
       const jurisdictionRequirements = getJurisdictionRequirements(jurisdictionResult.primary);
-      
+
+      // ===== HYBRID: Fallback to Browserless.io if Cheerio finds 0 policies =====
+      let finalHtmlVar = html;
+      let finalUrlVar = finalUrl;
+
+      // Initial parse with Cheerio to check if we have policies
+      const $static = cheerio.load(html || "");
+      const staticPolicies = findPolicyLinks($static, finalUrl);
+      const staticFoundCount = staticPolicies.filter(p => p.found).length;
+
+      if (staticFoundCount === 0) {
+        console.log('[scanner] No policies found via Cheerio, trying Browserless.io fallback...');
+        const browserlessResult = await fetchWithBrowserless(new URL(targetUrl));
+        if (browserlessResult) {
+          finalHtmlVar = browserlessResult.html;
+          finalUrlVar = browserlessResult.finalUrl;
+          console.log('[scanner] Browserless fallback found content, re-parsing...');
+        }
+      }
+
+      // Parse with (possibly Browserless-rendered) HTML
+      const $ = cheerio.load(finalHtmlVar || "");
       const policies = findPolicyLinks($, finalUrl);
+
+      const title = $("title").text().trim() || null;
+      const domain = new URL(finalUrl).hostname;
+      const businessType = detectBusinessType(finalHtmlVar || "");
 
       // Score policy quality for found policies
       const policyDetails = policies.map(p => {

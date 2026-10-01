@@ -10,6 +10,8 @@ services:
         value: production
       - key: SCANNER_API_KEY
         generateValue: true
+      - key: BROWSERLESS_API_KEY
+        sync: false
       - key: NODE_OPTIONS
         value: "--max-old-space-size=400"
       - key: NPM_CONFIG_LOGLEVEL
