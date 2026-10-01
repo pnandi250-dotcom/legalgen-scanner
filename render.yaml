@@ -12,3 +12,5 @@ services:
         generateValue: true
       - key: NODE_OPTIONS
         value: "--max-old-space-size=400"
+      - key: NPM_CONFIG_LOGLEVEL
+        value: "warn"
